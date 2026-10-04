@@ -20,6 +20,9 @@ pub struct PagesView {
     pub kb_filter: [String; 2],
     /// The OMSI-style "Add event..." browser is open for a keyboard section.
     pub kb_events: [bool; 2],
+    /// The keyboard action picker: which section it adds to, and its search query.
+    pub kb_picker: Option<usize>,
+    pub kb_picker_filter: String,
     /// (section, index) of the binding waiting for a key.
     pub capturing: Option<(usize, usize)>,
     pub drop_hover: bool,
@@ -1172,6 +1175,24 @@ fn action_text(names: &crate::describe::ControlNames, a: &str) -> String {
     known_action(a).unwrap_or_else(|| names.control(a))
 }
 
+fn action_options(names: &crate::describe::ControlNames, bindings: &Value, query: &str) -> Vec<(String, String)> {
+    let mut actions = names.actions();
+    for section in ["vehicles", "game"] {
+        if let Some(list) = bindings.get(section).and_then(Value::as_array) {
+            for action in list.iter().filter_map(|binding| binding.get("action").and_then(Value::as_str)) {
+                if !actions.iter().any(|(known, _)| known.eq_ignore_ascii_case(action)) {
+                    actions.push((action.to_string(), action_text(names, action)));
+                }
+            }
+        }
+    }
+    actions.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    let query = query.trim().to_lowercase();
+    actions.into_iter().filter(|(action, label)| {
+        query.is_empty() || action.to_lowercase().contains(&query) || label.to_lowercase().contains(&query)
+    }).collect()
+}
+
 fn control_names(l: &Launcher) -> &'static crate::describe::ControlNames {
     crate::describe::names(std::path::Path::new(&l.state.config.root), l.state.settings.get("language").and_then(|x| x.as_str()).unwrap_or("ENG"))
 }
@@ -1312,9 +1333,23 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         let inner = l.ui.heading(Rect::new(r.x + 18.0, r.y + 14.0, r.w - 36.0, r.h - 28.0), title, Some(if sec == 0 { "directions_bus" } else { "sports_esports" }));
         l.ui.text_in(sub, Rect::new(inner.x, inner.y - 6.0, inner.w, 18.0), 12.0, Weight::Regular, TEXT_DIM, Align::Left);
         let mut filter = std::mem::take(&mut l.pages.kb_filter[sec]);
-        let event_w = if sec == 0 { 138.0 } else { 0.0 };
-        let filter_w = if sec == 0 { (inner.w - event_w - GAP).max(120.0) } else { inner.w };
-        l.ui.text_input(&format!("kb-filter-{sec}"), Rect::new(inner.x, inner.y + 18.0, filter_w, 34.0), &mut filter, if l.pages.kb_events[sec] { "Filter events…" } else { "Filter…" }, Some("search"));
+        let event_w = if sec == 0 { 120.0 } else { 0.0 };
+        let add_w = if inner.w < 500.0 { 104.0 } else { 124.0 };
+        let buttons_w = event_w + if sec == 0 { GAP + add_w } else { add_w };
+        let filter_w = (inner.w - buttons_w - GAP).max(120.0);
+
+        l.ui.text_input(
+            &format!("kb-filter-{sec}"),
+            Rect::new(inner.x, inner.y + 18.0, filter_w, 34.0),
+            &mut filter,
+            if sec == 0 && l.pages.kb_events[sec] {
+                "Filter events…"
+            } else {
+                "Filter…"
+            },
+            Some("search"),
+        );
+
         if sec == 0 && l.ui.button(
             "kb-events",
             Rect::new(inner.x + filter_w + GAP, inner.y + 18.0, event_w, 34.0),
@@ -1324,6 +1359,24 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         ) {
             l.pages.kb_events[sec] = !l.pages.kb_events[sec];
             filter.clear();
+        }
+
+        let add_x = if sec == 0 {
+            inner.x + filter_w + GAP + event_w + GAP
+        } else {
+            inner.right() - add_w
+        };
+
+        if l.ui.button(
+            &format!("kb-add-{sec}"),
+            Rect::new(add_x, inner.y + 18.0, add_w, 34.0),
+            "Add binding",
+            Some("add"),
+            ButtonKind::Normal,
+        ) {
+            l.pages.kb_picker = Some(sec);
+            l.pages.kb_picker_filter.clear();
+            l.pages.capturing = None;
         }
         l.pages.kb_filter[sec] = filter.clone();
         let q = filter.to_lowercase();
@@ -1378,21 +1431,7 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         let mut clicked: Option<(usize, bool)> = None;
         let mut more: Option<usize> = None;
         let time = l.ui.time;
-        // a name the list does not have (a bus's own trigger a mod's readme gives a key, the
-        // Urbanway's `ASS_toggle`): added to the list as a key of its own, as an [entry]
-        // added to OMSI's keyboard.cfg by hand is (#854)
-        let new_action = filter.trim();
-        let mut list_top = inner.y + 62.0;
-        if shown.is_empty() && new_action.len() > 1 && new_action.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            if l.ui.button(&format!("kb-add-{sec}"), Rect::new(inner.x, list_top, inner.w, 36.0), &format!("Add \"{new_action}\" and give it a key"), Some("add"), ButtonKind::Normal) {
-                if let Some(a) = l.state.keybindings.get_mut(*key).and_then(|a| a.as_array_mut()) {
-                    a.push(json!({ "action": new_action, "scan_code": 0, "modifier": 0 }));
-                    l.pages.capturing = Some((sec, a.len() - 1));
-                }
-                // (the filter stays: the new row is the one it shows, waiting for its key)
-            }
-            list_top += 44.0;
-        }
+        let list_top = inner.y + 62.0;
         l.ui.scroll_area(&format!("kb-{sec}"), Rect::new(inner.x - 6.0, list_top, inner.w + 12.0, inner.bottom() - list_top), &mut |ui, v| {
             let rh = 40.0;
             for (row, (i, label, keyn, clash)) in shown.iter().enumerate() {
@@ -1459,6 +1498,70 @@ pub fn controls(l: &mut Launcher, area: Rect) {
     if !l.state.keybindings_error.is_empty() {
         let e = l.state.keybindings_error.clone();
         l.ui.text_in(&e, Rect::new(body.x, body.bottom() + 4.0, body.w, 18.0), 12.0, Weight::Medium, DANGER, Align::Left);
+    }
+}
+
+/// The searchable catalog of actions for a new keyboard binding.
+pub fn keybind_picker(l: &mut Launcher) {
+    let Some(section) = l.pages.kb_picker else { return };
+    let names = control_names(l);
+    let section_name = if section == 0 { "Driving & the bus" } else { "The game" };
+    let size = l.ui.size;
+    let full = Rect::new(0.0, 0.0, size.x, size.y);
+    l.ui.solid(full);
+    l.ui.p().rect(full, Color::rgba(0, 0, 0, 0.68));
+    let w = (size.x - 32.0).min(720.0);
+    let h = (size.y - 32.0).min(760.0);
+    let panel = Rect::new((size.x - w) * 0.5, (size.y - h) * 0.5, w, h);
+    l.ui.panel(panel);
+    let inner = panel.pad(20.0, 18.0);
+    l.ui.text_in("Add a key binding", Rect::new(inner.x, inner.y, inner.w, 28.0), 19.0, Weight::Bold, TEXT, Align::Left);
+    l.ui.text_in(section_name, Rect::new(inner.x, inner.y + 29.0, inner.w, 18.0), 12.0, Weight::Regular, TEXT_DIM, Align::Left);
+    let mut query = std::mem::take(&mut l.pages.kb_picker_filter);
+    l.ui.text_input("kb-picker-search", Rect::new(inner.x, inner.y + 54.0, inner.w, 36.0), &mut query, "Search actions…", Some("search"));
+    l.pages.kb_picker_filter = query.clone();
+    let options = action_options(names, &l.state.keybindings, &query);
+    let list = Rect::new(inner.x - 6.0, inner.y + 100.0, inner.w + 12.0, (inner.h - 154.0).max(80.0));
+    let mut picked: Option<String> = None;
+    l.ui.scroll_area("kb-action-picker", list, &mut |ui, view| {
+        if options.is_empty() {
+            ui.text_in("No matching actions.", Rect::new(view.x + 8.0, view.y + 8.0, view.w - 20.0, 24.0), 13.0, Weight::Regular, TEXT_DIM, Align::Left);
+            return 40.0;
+        }
+        let row_h = 50.0;
+        for (i, (action, label)) in options.iter().enumerate() {
+            let row = Rect::new(view.x + 6.0, view.y + i as f32 * row_h, view.w - 18.0, row_h - 4.0);
+            if row.bottom() < view.y || row.y > view.bottom() {
+                continue;
+            }
+            if ui.row(&format!("kb-picker-action-{action}"), row, false) {
+                picked = Some(action.clone());
+            }
+            ui.text_in(label, Rect::new(row.x + 12.0, row.y + 3.0, row.w - 24.0, 20.0), 13.0, Weight::Medium, TEXT, Align::Left);
+            ui.text_in(action, Rect::new(row.x + 12.0, row.y + 24.0, row.w - 24.0, 16.0), 10.5, Weight::Regular, TEXT_FAINT, Align::Left);
+        }
+        options.len() as f32 * row_h
+    });
+    let by = inner.bottom() - 38.0;
+    let custom = query.trim();
+    let custom_valid = custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !options.iter().any(|(action, _)| action.eq_ignore_ascii_case(custom));
+    if custom_valid && l.ui.button("kb-picker-custom", Rect::new(inner.x, by, 220.0, 36.0), "Add custom action", Some("add"), ButtonKind::Normal) {
+        picked = Some(custom.to_string());
+    }
+    if l.ui.button("kb-picker-cancel", Rect::new(inner.right() - 110.0, by, 110.0, 36.0), "Cancel", None, ButtonKind::Ghost) {
+        l.pages.kb_picker = None;
+        l.pages.kb_picker_filter.clear();
+        return;
+    }
+    if let Some(action) = picked {
+        let key = if section == 0 { "vehicles" } else { "game" };
+        if let Some(bindings) = l.state.keybindings.get_mut(key).and_then(Value::as_array_mut) {
+            bindings.push(json!({ "action": action, "scan_code": 0, "modifier": 0 }));
+            l.pages.capturing = Some((section, bindings.len() - 1));
+        }
+        l.pages.kb_picker = None;
+        l.pages.kb_picker_filter.clear();
     }
 }
 
@@ -2888,5 +2991,33 @@ mod pad_remove_tests {
         assert_eq!(super::remove_device(&mut devices, &mut sel), "SideWinder Joystick");
         assert_eq!(sel, 0);
         assert!(names(&cfg_text(&devices)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod keybind_picker_tests {
+    use super::*;
+
+    #[test]
+    fn empty_search_shows_the_catalog_and_configured_custom_actions() {
+        let names = crate::describe::ControlNames::from_table("ENG", &[
+            ("door", "Front door"),
+            ("horn", "Horn"),
+        ]);
+        let bindings = json!({
+            "game": [{ "action": "mod_custom_action" }],
+            "vehicles": [{ "action": "door" }],
+        });
+
+        let all = action_options(&names, &bindings, "");
+        let actions: Vec<&str> = all.iter().map(|(action, _)| action.as_str()).collect();
+        assert_eq!(actions.len(), 3);
+        assert!(actions.contains(&"door"));
+        assert!(actions.contains(&"horn"));
+        assert!(actions.contains(&"mod_custom_action"));
+
+        let matches = action_options(&names, &bindings, "front door");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "door");
     }
 }

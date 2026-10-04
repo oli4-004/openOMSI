@@ -68,6 +68,15 @@ impl ControlNames {
         ControlNames { lang, texts, spellings }
     }
 
+    /// The actions OMSI's key assignment dialog can show, paired with their readable names.
+    pub fn actions(&self) -> Vec<(String, String)> {
+        let mut actions: Vec<_> = self.texts.iter()
+            .map(|(action, label)| (action.clone(), label.clone()))
+            .collect();
+        actions.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then_with(|| a.0.cmp(&b.0)));
+        actions
+    }
+
     /// The same names from a table (tests).
     #[cfg(test)]
     pub fn from_table(lang: &str, table: &[(&str, &str)]) -> ControlNames {
