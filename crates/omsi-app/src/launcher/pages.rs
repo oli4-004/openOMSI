@@ -30,6 +30,10 @@ pub struct PagesView {
     pub setup_game: Option<String>,
     /// The Controls page's tab: 0 the keyboard, 1 the game controllers.
     pub controls_tab: usize,
+    /// Trigger names collected from installed vehicle scripts for the action picker.
+    pub kb_script_actions: Option<Vec<String>>,
+    pub kb_script_actions_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    pub kb_script_action_generation: Option<u64>,
     /// The Settings page's tab (see `SETTINGS_TABS`).
     pub settings_tab: usize,
     pub pads: PadsView,
@@ -1175,8 +1179,13 @@ fn action_text(names: &crate::describe::ControlNames, a: &str) -> String {
     known_action(a).unwrap_or_else(|| names.control(a))
 }
 
-fn action_options(names: &crate::describe::ControlNames, bindings: &Value, query: &str) -> Vec<(String, String)> {
+fn action_options(names: &crate::describe::ControlNames, script_actions: &[String], bindings: &Value, query: &str) -> Vec<(String, String)> {
     let mut actions = names.actions();
+    for action in script_actions {
+        if !actions.iter().any(|(known, _)| known.eq_ignore_ascii_case(action)) {
+            actions.push((action.clone(), action_text(names, action)));
+        }
+    }
     for section in ["vehicles", "game"] {
         if let Some(list) = bindings.get(section).and_then(Value::as_array) {
             for action in list.iter().filter_map(|binding| binding.get("action").and_then(Value::as_str)) {
@@ -1505,6 +1514,29 @@ pub fn controls(l: &mut Launcher, area: Rect) {
 pub fn keybind_picker(l: &mut Launcher) {
     let Some(section) = l.pages.kb_picker else { return };
     let names = control_names(l);
+    if l.pages.kb_script_action_generation != Some(l.state.content_generation) {
+        l.pages.kb_script_actions = None;
+        l.pages.kb_script_actions_rx = None;
+        l.pages.kb_script_action_generation = Some(l.state.content_generation);
+    }
+    if l.pages.kb_script_actions.is_none() && l.pages.kb_script_actions_rx.is_none() {
+        let _ = core::content_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::describe::ControlNames::script_actions());
+        });
+        l.pages.kb_script_actions_rx = Some(rx);
+    }
+    let completed = l.pages.kb_script_actions_rx.as_ref().and_then(|rx| match rx.try_recv() {
+        Ok(actions) => Some(actions),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+    });
+    if let Some(actions) = completed {
+        l.pages.kb_script_actions = Some(actions);
+        l.pages.kb_script_actions_rx = None;
+    }
+    let script_actions = l.pages.kb_script_actions.as_deref().unwrap_or(&[]);
     let section_name = if section == 0 { "Driving & the bus" } else { "The game" };
     let size = l.ui.size;
     let full = Rect::new(0.0, 0.0, size.x, size.y);
@@ -1520,8 +1552,13 @@ pub fn keybind_picker(l: &mut Launcher) {
     let mut query = std::mem::take(&mut l.pages.kb_picker_filter);
     l.ui.text_input("kb-picker-search", Rect::new(inner.x, inner.y + 54.0, inner.w, 36.0), &mut query, "Search actions…", Some("search"));
     l.pages.kb_picker_filter = query.clone();
-    let options = action_options(names, &l.state.keybindings, &query);
-    let list = Rect::new(inner.x - 6.0, inner.y + 100.0, inner.w + 12.0, (inner.h - 154.0).max(80.0));
+    let options = action_options(names, script_actions, &l.state.keybindings, &query);
+    let list = Rect::new(inner.x - 6.0, inner.y + 120.0, inner.w + 12.0, (inner.h - 174.0).max(80.0));
+    l.ui.text_in(
+        if l.pages.kb_script_actions.is_some() { "Installed bus controls" } else { "Scanning installed bus scripts for additional controls…" },
+        Rect::new(inner.x, inner.y + 96.0, inner.w, 18.0),
+        11.5, Weight::Regular, TEXT_DIM, Align::Left,
+    );
     let mut picked: Option<String> = None;
     l.ui.scroll_area("kb-action-picker", list, &mut |ui, view| {
         if options.is_empty() {
@@ -1544,7 +1581,7 @@ pub fn keybind_picker(l: &mut Launcher) {
     });
     let by = inner.bottom() - 38.0;
     let custom = query.trim();
-    let custom_valid = custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let custom_valid = l.pages.kb_script_actions.is_some() && custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !options.iter().any(|(action, _)| action.eq_ignore_ascii_case(custom));
     if custom_valid && l.ui.button("kb-picker-custom", Rect::new(inner.x, by, 220.0, 36.0), "Add custom action", Some("add"), ButtonKind::Normal) {
         picked = Some(custom.to_string());
@@ -3009,14 +3046,14 @@ mod keybind_picker_tests {
             "vehicles": [{ "action": "door" }],
         });
 
-        let all = action_options(&names, &bindings, "");
+        let all = action_options(&names, &[], &bindings, "");
         let actions: Vec<&str> = all.iter().map(|(action, _)| action.as_str()).collect();
         assert_eq!(actions.len(), 3);
         assert!(actions.contains(&"door"));
         assert!(actions.contains(&"horn"));
         assert!(actions.contains(&"mod_custom_action"));
 
-        let matches = action_options(&names, &bindings, "front door");
+        let matches = action_options(&names, &[], &bindings, "front door");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, "door");
     }

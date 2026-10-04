@@ -77,6 +77,42 @@ impl ControlNames {
         actions
     }
 
+    /// Trigger names compiled from every installed vehicle's scripts, including mod buses.
+    pub fn script_actions() -> Vec<String> {
+        let mut buses = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for vehicles in omsi_cfg::content_dirs("Vehicles") {
+            for pack in omsi_cfg::vfs::read_dir_paths(&vehicles) {
+                if !omsi_cfg::vfs::is_dir(&pack) {
+                    continue;
+                }
+                for path in omsi_cfg::vfs::read_dir_paths(&pack) {
+                    let is_vehicle = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bus") || ext.eq_ignore_ascii_case("ovh"));
+                    if !is_vehicle {
+                        continue;
+                    }
+                    let key = path.strip_prefix(&vehicles).unwrap_or(&path).to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+                    if seen.insert(key) {
+                        buses.push(path);
+                    }
+                }
+            }
+        }
+        buses.sort();
+
+        let mut actions = std::collections::BTreeSet::new();
+        let mut script_sets = std::collections::HashSet::new();
+        for bus in buses {
+            let Ok(vehicle) = omsi_vehicle::Vehicle::load(&bus) else { continue };
+            let scripts = &vehicle.scripts.scripts;
+            let key = scripts.iter().map(|p| p.to_string_lossy().to_ascii_lowercase()).collect::<Vec<_>>().join("\0");
+            if script_sets.insert(key) {
+                actions.extend(script_triggers(scripts));
+            }
+        }
+        actions.into_iter().collect()
+    }
+
     /// The same names from a table (tests).
     #[cfg(test)]
     pub fn from_table(lang: &str, table: &[(&str, &str)]) -> ControlNames {
@@ -150,6 +186,35 @@ impl ControlNames {
             return humanize(mesh_stem);
         }
         translate(mesh_stem)
+    }
+}
+
+fn script_triggers(scripts: &[std::path::PathBuf]) -> Vec<String> {
+    omsi_script::compile(&omsi_script::CompileInput { scripts: scripts.to_vec(), ..Default::default() }).trigger_names()
+}
+
+#[cfg(test)]
+mod script_action_tests {
+    use super::*;
+
+    #[test]
+    fn discovers_custom_triggers_from_a_bus_script() {
+        let dir = std::env::temp_dir().join(format!(
+            "openomsi_key_actions_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus = dir.join("mod_bus.bus");
+        std::fs::write(&bus, "[script]\n1\nmain.osc\n").unwrap();
+        std::fs::write(
+            dir.join("main.osc"),
+            "{trigger:cruise_control_toggle}\n{end}\n{trigger:ivu_ticket_cancel}\n{end}\n",
+        ).unwrap();
+
+        let actions = script_triggers(&omsi_vehicle::Vehicle::load(&bus).unwrap().scripts.scripts);
+        assert_eq!(actions, ["cruise_control_toggle", "ivu_ticket_cancel"]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

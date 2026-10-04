@@ -200,6 +200,8 @@ pub struct State {
     pub lines: Vec<core::LineInfo>,
     pub lines_for: (String, String),
     pub loading_content: bool,
+    /// Increased whenever the installed content is read again.
+    pub content_generation: u64,
     /// The lists are filled while they are read (the first reading: nothing to show yet).
     pub content_first: bool,
     /// The content changed while it was being read: read it again when that is done.
@@ -284,6 +286,7 @@ impl State {
             lines: Vec::new(),
             lines_for: (String::new(), String::new()),
             loading_content: false,
+            content_generation: 0,
             content_first: false,
             reload_content: false,
             loading_lines: false,
@@ -383,6 +386,7 @@ impl State {
     }
 
     pub fn load_content(&mut self) {
+        self.content_generation = self.content_generation.wrapping_add(1);
         self.loading_content = true;
         // the first reading shows what it has read as it goes: a big installation's buses
         // (thousands of folders) took minutes, with nothing on the page all that time
