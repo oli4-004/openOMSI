@@ -36,11 +36,15 @@ pub struct PagesView {
     /// Sources indexed by action name, filled as installed vehicle scripts are scanned.
     pub kb_script_actions: Option<std::collections::HashMap<String, Vec<String>>>,
     pub kb_script_actions_rx: Option<std::sync::mpsc::Receiver<crate::describe::ScriptActionScanUpdate>>,
+    kb_script_actions_root: Option<std::path::PathBuf>,
+    kb_script_cache_loaded: bool,
+    kb_script_scan_actions: Option<std::collections::HashMap<String, Vec<String>>>,
+    kb_script_scan_paths: Vec<String>,
     kb_source_paths: Vec<String>,
     kb_source_path_set: std::collections::HashSet<String>,
     kb_source_suggestions: Option<(String, Vec<String>)>,
-    pub kb_script_action_generation: Option<u64>,
     pub kb_script_scan: (usize, usize, String),
+    kb_script_total_buses: usize,
     pub kb_script_scan_complete: bool,
     kb_action_options: Option<Vec<KeyActionOption>>,
     kb_filtered_options: Option<(String, String, Vec<KeyActionOption>)>,
@@ -1345,31 +1349,87 @@ fn bus_usage_label(bus_count: usize, total_bus_count: usize) -> String {
     format!("Used by {bus_count}/{total_bus_count} buses")
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ScriptActionCache {
+    version: u32,
+    root: String,
+    actions: std::collections::HashMap<String, Vec<String>>,
+    source_paths: Vec<String>,
+    total_buses: usize,
+}
+
+fn script_action_cache_path() -> std::path::PathBuf {
+    core::data_dir().join("cache").join("key-actions.json")
+}
+
+fn load_script_action_cache(path: &std::path::Path, root: &str) -> Result<Option<ScriptActionCache>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let cache: ScriptActionCache = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok((cache.version == 1 && cache.root == root).then_some(cache))
+}
+
+fn save_script_action_cache(path: &std::path::Path, cache: &ScriptActionCache) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "cache path has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(cache).map_err(|error| error.to_string())?;
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
+}
+
 fn control_names(l: &Launcher) -> &'static crate::describe::ControlNames {
     crate::describe::names(std::path::Path::new(&l.state.config.root), l.state.settings.get("language").and_then(|x| x.as_str()).unwrap_or("ENG"))
 }
 
 fn ensure_key_action_catalog(l: &mut Launcher) {
-    if l.pages.kb_script_action_generation != Some(l.state.content_generation) {
+    let root = std::path::PathBuf::from(&l.state.config.root);
+    if l.pages.kb_script_actions_root.as_ref() != Some(&root) {
         l.pages.kb_script_actions = None;
         l.pages.kb_script_actions_rx = None;
+        l.pages.kb_script_cache_loaded = false;
+        l.pages.kb_script_scan_actions = None;
+        l.pages.kb_script_scan_paths.clear();
+        l.pages.kb_script_actions_root = Some(root);
         l.pages.kb_source_paths.clear();
         l.pages.kb_source_path_set.clear();
         l.pages.kb_source_suggestions = None;
         l.pages.kb_script_scan = (0, 0, String::new());
+        l.pages.kb_script_total_buses = 0;
         l.pages.kb_script_scan_complete = false;
         l.pages.kb_action_options = None;
         l.pages.kb_filtered_options = None;
         l.pages.controller_action_choices = None;
-        l.pages.kb_script_action_generation = Some(l.state.content_generation);
     }
-    if l.pages.kb_script_actions.is_none() && l.pages.kb_script_actions_rx.is_none() {
+    if !l.pages.kb_script_cache_loaded {
+        l.pages.kb_script_cache_loaded = true;
+        match load_script_action_cache(&script_action_cache_path(), &l.state.config.root) {
+            Ok(Some(cache)) => {
+                l.pages.kb_script_actions = Some(cache.actions);
+                l.pages.kb_source_paths = cache.source_paths;
+                l.pages.kb_source_path_set = l.pages.kb_source_paths.iter().map(|path| path.to_lowercase()).collect();
+                l.pages.kb_script_scan = (cache.total_buses, cache.total_buses, String::new());
+                l.pages.kb_script_total_buses = cache.total_buses;
+                l.pages.kb_source_suggestions = None;
+                l.pages.kb_action_options = None;
+                l.pages.kb_filtered_options = None;
+                log::info!("key action catalog: loaded {} actions from cache", l.pages.kb_script_actions.as_ref().map_or(0, |actions| actions.len()));
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("key action catalog cache could not be loaded: {error}"),
+        }
+    }
+    if l.pages.kb_script_actions_rx.is_none() && !l.pages.kb_script_scan_complete {
         let _ = core::content_dir();
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         std::thread::spawn(move || {
             crate::describe::ControlNames::scan_script_actions(|update| { let _ = tx.send(update); });
         });
-        l.pages.kb_script_actions = Some(std::collections::HashMap::new());
+        l.pages.kb_script_scan_actions = Some(std::collections::HashMap::new());
+        l.pages.kb_script_scan_paths.clear();
+        l.pages.kb_source_path_set.clear();
+        l.pages.kb_script_scan = (0, 0, String::new());
         l.pages.kb_script_actions_rx = Some(rx);
     }
     let scan_was_complete = l.pages.kb_script_scan_complete;
@@ -1379,19 +1439,20 @@ fn ensure_key_action_catalog(l: &mut Launcher) {
                 Ok(update) => update,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("key action scan stopped before it completed");
                     l.pages.kb_script_scan_complete = true;
                     break;
                 }
             };
             l.pages.kb_script_scan = (update.done, update.total, update.current);
+            l.pages.kb_script_total_buses = update.total;
             for (_, source) in &update.discovered {
                 let path = source_path(source);
                 if l.pages.kb_source_path_set.insert(path.to_lowercase()) {
-                    l.pages.kb_source_paths.push(path);
-                    l.pages.kb_source_suggestions = None;
+                    l.pages.kb_script_scan_paths.push(path);
                 }
             }
-            if let Some(actions) = l.pages.kb_script_actions.as_mut() {
+            if let Some(actions) = l.pages.kb_script_scan_actions.as_mut() {
                 for (action, source) in update.discovered {
                     let sources = actions.entry(action.to_ascii_lowercase()).or_default();
                     if !sources.iter().any(|existing| existing.eq_ignore_ascii_case(&source)) {
@@ -1399,15 +1460,32 @@ fn ensure_key_action_catalog(l: &mut Launcher) {
                     }
                 }
             }
-            l.pages.kb_script_scan_complete |= update.complete;
+            if update.complete {
+                l.pages.kb_script_scan_complete = true;
+                let actions = l.pages.kb_script_scan_actions.take().unwrap_or_default();
+                let source_paths = std::mem::take(&mut l.pages.kb_script_scan_paths);
+                l.pages.kb_source_path_set = source_paths.iter().map(|path| path.to_lowercase()).collect();
+                l.pages.kb_source_paths = source_paths;
+                l.pages.kb_source_paths.sort_by_key(|path| normalize_source_query(path));
+                let cache = ScriptActionCache {
+                    version: 1,
+                    root: l.state.config.root.clone(),
+                    actions: actions.clone(),
+                    source_paths: l.pages.kb_source_paths.clone(),
+                    total_buses: update.total,
+                };
+                if let Err(error) = save_script_action_cache(&script_action_cache_path(), &cache) {
+                    log::warn!("key action catalog cache could not be saved: {error}");
+                }
+                l.pages.kb_script_actions = Some(actions);
+                l.pages.kb_source_suggestions = None;
+            }
         }
     }
     if l.pages.kb_script_scan_complete {
         l.pages.kb_script_actions_rx = None;
     }
     if l.pages.kb_script_scan_complete && !scan_was_complete {
-        l.pages.kb_source_paths.sort_by_key(|path| normalize_source_query(path));
-        l.pages.kb_source_suggestions = None;
         l.pages.kb_action_options = None;
         l.pages.kb_filtered_options = None;
         l.pages.controller_action_choices = None;
@@ -1860,6 +1938,8 @@ pub fn keybind_picker(l: &mut Launcher) {
         format!("{} results · scanned {total} vehicle files", options.len())
     } else if *total > 0 {
         format!("{} results · scanning {done} / {total} · {current}", options.len())
+    } else if l.pages.kb_script_actions.is_some() {
+        format!("{} results · checking installed bus scripts…", options.len())
     } else {
         format!("{} results · finding installed bus scripts…", options.len())
     };
@@ -1874,7 +1954,7 @@ pub fn keybind_picker(l: &mut Launcher) {
     let list = Rect::new(inner.x - 6.0, inner.y + 130.0 + suggestions_height, inner.w + 12.0, (inner.h - 184.0 - suggestions_height).max(80.0));
     let mut picked: Option<String> = None;
     let mut show_sources: Option<(String, Vec<String>)> = None;
-    let total_bus_count = l.pages.kb_script_scan.1;
+    let total_bus_count = l.pages.kb_script_total_buses;
     l.ui.scroll_area("kb-action-picker", list, &mut |ui, view| {
         if options.is_empty() {
             ui.text_in("No matching actions.", Rect::new(view.x + 8.0, view.y + 8.0, view.w - 20.0, 24.0), 13.0, Weight::Regular, TEXT_DIM, Align::Left);
@@ -3458,6 +3538,35 @@ mod keybind_picker_tests {
     fn bus_usage_label_shows_the_action_count_out_of_the_scan_total() {
         assert_eq!(bus_usage_label(5, 25), "Used by 5/25 buses");
         assert_eq!(bus_usage_label(1, 25), "Used by 1/25 buses");
+    }
+
+    #[test]
+    fn script_action_cache_round_trips_and_is_scoped_to_the_install_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "openomsi_action_cache_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let path = dir.join("key-actions.json");
+        let cache = ScriptActionCache {
+            version: 1,
+            root: "C:\\OMSI 2".into(),
+            actions: std::collections::HashMap::from([(
+                "cruise_control".into(),
+                vec!["BusPack/Bus.bus (Example Bus)".into()],
+            )]),
+            source_paths: vec!["BusPack/Bus.bus".into()],
+            total_buses: 12,
+        };
+
+        save_script_action_cache(&path, &cache).unwrap();
+        let loaded = load_script_action_cache(&path, "C:\\OMSI 2").unwrap().unwrap();
+        assert_eq!(loaded.actions, cache.actions);
+        assert_eq!(loaded.source_paths, cache.source_paths);
+        assert_eq!(loaded.total_buses, cache.total_buses);
+        assert!(load_script_action_cache(&path, "D:\\OMSI 2").unwrap().is_none());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
