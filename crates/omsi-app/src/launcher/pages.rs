@@ -18,8 +18,6 @@ pub struct PagesView {
     /// The "reset every setting" dialog is open.
     pub confirm_reset: bool,
     pub kb_filter: [String; 2],
-    /// The OMSI-style "Add event..." browser is open for a keyboard section.
-    pub kb_events: [bool; 2],
     /// The keyboard action picker: which section it adds to, and its search query.
     pub kb_picker: Option<usize>,
     pub kb_picker_filter: String,
@@ -1207,22 +1205,55 @@ fn action_options(
     script_actions: &std::collections::HashMap<String, Vec<String>>,
     bindings: &Value,
 ) -> Vec<KeyActionOption> {
-    let mut actions: std::collections::HashMap<String, KeyActionOption> = std::collections::HashMap::new();
+    let mut actions: std::collections::HashMap<String, KeyActionOption> =
+        std::collections::HashMap::new();
+
     for (action, label) in names.actions() {
-        actions.insert(action.to_ascii_lowercase(), KeyActionOption {
-            action,
-            label,
-            sources: vec!["Installed key-language files".into()],
-            bus_paths: Vec::new(),
-        });
+        actions.insert(
+            action.to_ascii_lowercase(),
+            KeyActionOption {
+                action,
+                label,
+                sources: vec!["Installed key-language files".into()],
+                bus_paths: Vec::new(),
+            },
+        );
     }
+
+    // OMSI's event browser uses events(), which preserves the original spelling
+    // from the language files' spelling table. Prefer that spelling in the picker.
+    for (action, label) in names.events() {
+        let key = action.to_ascii_lowercase();
+
+        if let Some(option) = actions.get_mut(&key) {
+            option.action = action.clone();
+            option.label = label.clone();
+            if !option.sources.iter().any(|source| source == "OMSI event") {
+                option.sources.push("OMSI event".into());
+            }
+        } else {
+            actions.insert(
+                key,
+                KeyActionOption {
+                    action,
+                    label,
+                    sources: vec!["OMSI event".into()],
+                    bus_paths: Vec::new(),
+                },
+            );
+        }
+    }
+
     for (action, sources) in script_actions {
-        let option = actions.entry(action.to_ascii_lowercase()).or_insert_with(|| KeyActionOption {
-            action: action.clone(),
-            label: action_text(names, action),
-            sources: Vec::new(),
-            bus_paths: Vec::new(),
-        });
+        let option = actions
+            .entry(action.to_ascii_lowercase())
+            .or_insert_with(|| KeyActionOption {
+                action: action.clone(),
+                label: action_text(names, action),
+                sources: Vec::new(),
+                bus_paths: Vec::new(),
+            });
+
         for source in sources {
             let source = format!("Bus script: {source}");
             if !option.sources.contains(&source) {
@@ -1230,26 +1261,46 @@ fn action_options(
             }
         }
     }
+
     for section in ["vehicles", "game"] {
         if let Some(list) = bindings.get(section).and_then(Value::as_array) {
-            for action in list.iter().filter_map(|binding| binding.get("action").and_then(Value::as_str)) {
-                let option = actions.entry(action.to_ascii_lowercase()).or_insert_with(|| KeyActionOption {
-                    action: action.to_string(),
-                    label: action_text(names, action),
-                    sources: Vec::new(),
-                    bus_paths: Vec::new(),
-                });
-                if !option.sources.iter().any(|s| s == "Configured binding") {
+            for action in list
+                .iter()
+                .filter_map(|binding| binding.get("action").and_then(Value::as_str))
+            {
+                let option = actions
+                    .entry(action.to_ascii_lowercase())
+                    .or_insert_with(|| KeyActionOption {
+                        action: action.to_string(),
+                        label: action_text(names, action),
+                        sources: Vec::new(),
+                        bus_paths: Vec::new(),
+                    });
+
+                if !option
+                    .sources
+                    .iter()
+                    .any(|source| source == "Configured binding")
+                {
                     option.sources.push("Configured binding".into());
                 }
             }
         }
     }
+
     let mut options: Vec<_> = actions.into_values().collect();
+
     for option in &mut options {
         option.bus_paths = bus_source_paths(&option.sources);
     }
-    options.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()).then_with(|| a.action.to_lowercase().cmp(&b.action.to_lowercase())));
+
+    options.sort_by(|a, b| {
+        a.label
+            .to_lowercase()
+            .cmp(&b.label.to_lowercase())
+            .then_with(|| a.action.to_lowercase().cmp(&b.action.to_lowercase()))
+    });
+
     options
 }
 
@@ -1633,43 +1684,21 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         let inner = l.ui.heading(Rect::new(r.x + 18.0, r.y + 14.0, r.w - 36.0, r.h - 28.0), title, Some(if sec == 0 { "directions_bus" } else { "sports_esports" }));
         l.ui.text_in(sub, Rect::new(inner.x, inner.y - 6.0, inner.w, 18.0), 12.0, Weight::Regular, TEXT_DIM, Align::Left);
         let mut filter = std::mem::take(&mut l.pages.kb_filter[sec]);
-        let event_w = if sec == 0 { 120.0 } else { 0.0 };
+
         let add_w = if inner.w < 500.0 { 104.0 } else { 124.0 };
-        let buttons_w = event_w + if sec == 0 { GAP + add_w } else { add_w };
-        let filter_w = (inner.w - buttons_w - GAP).max(120.0);
+        let filter_w = (inner.w - add_w - GAP).max(120.0);
 
         l.ui.text_input(
             &format!("kb-filter-{sec}"),
             Rect::new(inner.x, inner.y + 18.0, filter_w, 34.0),
             &mut filter,
-            if sec == 0 && l.pages.kb_events[sec] {
-                "Filter events…"
-            } else {
-                "Filter…"
-            },
+            "Filter…",
             Some("search"),
         );
 
-        if sec == 0 && l.ui.button(
-            "kb-events",
-            Rect::new(inner.x + filter_w + GAP, inner.y + 18.0, event_w, 34.0),
-            if l.pages.kb_events[sec] { "Back to keys" } else { "Add event…" },
-            Some(if l.pages.kb_events[sec] { "arrow_back" } else { "add" }),
-            ButtonKind::Normal,
-        ) {
-            l.pages.kb_events[sec] = !l.pages.kb_events[sec];
-            filter.clear();
-        }
-
-        let add_x = if sec == 0 {
-            inner.x + filter_w + GAP + event_w + GAP
-        } else {
-            inner.right() - add_w
-        };
-
         if l.ui.button(
             &format!("kb-add-{sec}"),
-            Rect::new(add_x, inner.y + 18.0, add_w, 34.0),
+            Rect::new(inner.right() - add_w, inner.y + 18.0, add_w, 34.0),
             "Add binding",
             Some("add"),
             ButtonKind::Normal,
@@ -1681,40 +1710,9 @@ pub fn controls(l: &mut Launcher, area: Rect) {
             l.pages.kb_filtered_options = None;
             l.pages.capturing = None;
         }
+
         l.pages.kb_filter[sec] = filter.clone();
         let q = filter.to_lowercase();
-
-        // OMSI's Add event dialog: all KY_ events from the language files, including
-        // event tables supplied by installed mods. Picking one adds an unbound vehicle
-        // entry and immediately waits for its key.
-        if sec == 0 && l.pages.kb_events[sec] {
-            let mut events = names.events();
-            if !q.is_empty() {
-                events.retain(|(action, label)| action.to_lowercase().contains(&q) || matches(label, &q));
-            }
-            let mut picked: Option<String> = None;
-            l.ui.scroll_area(&format!("kb-events-{sec}"), Rect::new(inner.x - 6.0, inner.y + 62.0, inner.w + 12.0, inner.bottom() - (inner.y + 62.0)), &mut |ui, v| {
-                let rh = 40.0;
-                for (row, (action, label)) in events.iter().enumerate() {
-                    let rr = Rect::new(v.x + 6.0, v.y + row as f32 * rh, v.w - 16.0, rh - 4.0);
-                    let shown = format!("{label}  ·  KY_{action}");
-                    if ui.button(&format!("kb-event-{row}"), rr, &shown, Some("add"), ButtonKind::Ghost) {
-                        picked = Some(action.clone());
-                    }
-                }
-                events.len() as f32 * rh
-            });
-            if let Some(action) = picked {
-                if let Some(a) = l.state.keybindings.get_mut("vehicles").and_then(|a| a.as_array_mut()) {
-                    a.push(json!({ "action": action.clone(), "scan_code": 0, "modifier": 0 }));
-                    l.pages.capturing = Some((0, a.len() - 1));
-                    l.pages.kb_events[0] = false;
-                    l.pages.kb_filter[0] = action;
-                    l.state.set_status("Event added. Press the key you want to use (Escape cancels).", false);
-                }
-            }
-            continue;
-        }
 
         let list: Vec<(usize, String, i64, i64)> = l.state.keybindings.get(*key).and_then(|a| a.as_array()).map(|a| a.iter().enumerate().map(|(i, b)| (i, b.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string(), b.get("scan_code").and_then(|x| x.as_i64()).unwrap_or(0), b.get("modifier").and_then(|x| x.as_i64()).unwrap_or(0))).collect()).unwrap_or_default();
         let mut shown: Vec<(usize, String, String, bool, bool)> = list
@@ -1729,13 +1727,54 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         if sec == 1 {
             shown.sort_by_key(|(_, label, _, _, _)| !label.starts_with("VR:"));
         }
+
+        // a name the list does not have (a bus's own trigger a mod's readme gives a key, the
+        // Urbanway's `ASS_toggle`): added to the list as a key of its own, as an [entry]
+        // added to OMSI's keyboard.cfg by hand is (#854)
+        let new_action = filter.trim();
+        let mut custom_action_added = false;
+
+        if shown.is_empty()
+            && new_action.len() > 1
+            && new_action
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            if l.ui.button(
+                &format!("kb-add-custom-{sec}"),
+                Rect::new(inner.x, inner.y + 62.0, inner.w, 36.0),
+                &format!("Add \"{new_action}\" and give it a key"),
+                Some("add"),
+                ButtonKind::Normal,
+            ) {
+                if let Some(a) = l
+                    .state
+                    .keybindings
+                    .get_mut(*key)
+                    .and_then(|a| a.as_array_mut())
+                {
+                    a.push(json!({
+                        "action": new_action,
+                        "scan_code": 0,
+                        "modifier": 0
+                    }));
+                    l.pages.capturing = Some((sec, a.len() - 1));
+                }
+            }
+            custom_action_added = true;
+        }
+
         let capturing = l.pages.capturing;
         #[derive(Clone, Copy)]
         enum BindingRowAction { Capture, Clear, Remove }
         let mut clicked: Option<(usize, BindingRowAction)> = None;
         let mut more: Option<usize> = None;
         let time = l.ui.time;
-        let list_top = inner.y + 62.0;
+        let list_top = if custom_action_added {
+            inner.y + 106.0
+        } else {
+            inner.y + 62.0
+        };
         l.ui.scroll_area(&format!("kb-{sec}"), Rect::new(inner.x - 6.0, list_top, inner.w + 12.0, inner.bottom() - list_top), &mut |ui, v| {
             let rh = 40.0;
             for (row, (i, label, keyn, clash, duplicate_action)) in shown.iter().enumerate() {
@@ -1851,50 +1890,114 @@ pub fn controls(l: &mut Launcher, area: Rect) {
 
 /// The searchable catalog of actions for a new keyboard binding.
 pub fn keybind_picker(l: &mut Launcher) {
-    let Some(section) = l.pages.kb_picker else { return };
+    let Some(section) = l.pages.kb_picker else {
+        return;
+    };
+
     if let Some((action, paths)) = l.pages.kb_source_action.clone() {
         keybind_sources_dialog(l, &action, &paths);
         return;
     }
+
     ensure_key_action_catalog(l);
-    let section_name = if section == 0 { "Driving & the bus" } else { "The game" };
+
+    let section_name = if section == 0 {
+        "Driving & the bus"
+    } else {
+        "The game"
+    };
+
     let size = l.ui.size;
     let full = Rect::new(0.0, 0.0, size.x, size.y);
     l.ui.solid(full);
     l.ui.p().rect(full, Color::rgba(0, 0, 0, 0.68));
+
     let w = (size.x - 32.0).min(720.0);
     let h = (size.y - 32.0).min(760.0);
     let panel = Rect::new((size.x - w) * 0.5, (size.y - h) * 0.5, w, h);
     l.ui.panel(panel);
+
     let inner = panel.pad(20.0, 18.0);
-    l.ui.text_in("Add a key binding", Rect::new(inner.x, inner.y, inner.w, 28.0), 19.0, Weight::Bold, TEXT, Align::Left);
-    l.ui.text_in(section_name, Rect::new(inner.x, inner.y + 29.0, inner.w, 18.0), 12.0, Weight::Regular, TEXT_DIM, Align::Left);
+
+    l.ui.text_in(
+        "Add a key binding",
+        Rect::new(inner.x, inner.y, inner.w, 28.0),
+        19.0,
+        Weight::Bold,
+        TEXT,
+        Align::Left,
+    );
+
+    l.ui.text_in(
+        section_name,
+        Rect::new(inner.x, inner.y + 29.0, inner.w, 18.0),
+        12.0,
+        Weight::Regular,
+        TEXT_DIM,
+        Align::Left,
+    );
+
     let filter_gap = 12.0;
     let filter_w = (inner.w - filter_gap) * 0.5;
+
     let mut query = std::mem::take(&mut l.pages.kb_picker_filter);
-    let query_changed = l.ui.text_input("kb-picker-search", Rect::new(inner.x, inner.y + 54.0, filter_w, 36.0), &mut query, "Search actions…", Some("search"));
+    let query_changed = l.ui.text_input(
+        "kb-picker-search",
+        Rect::new(inner.x, inner.y + 54.0, filter_w, 36.0),
+        &mut query,
+        "Search actions…",
+        Some("search"),
+    );
     l.pages.kb_picker_filter = query.clone();
+
     let mut source_query = std::mem::take(&mut l.pages.kb_picker_source_filter);
     let mut source_changed = l.ui.text_input(
         "kb-picker-source-search",
-        Rect::new(inner.x + filter_w + filter_gap, inner.y + 54.0, filter_w, 36.0),
+        Rect::new(
+            inner.x + filter_w + filter_gap,
+            inner.y + 54.0,
+            filter_w,
+            36.0,
+        ),
         &mut source_query,
         "Filter by bus folder or bus file (.bus)",
         Some("folder_open"),
     );
     l.pages.kb_picker_source_filter = source_query.clone();
-    let suggestions_changed = l.pages.kb_source_suggestions.as_ref()
+
+    let suggestions_changed = l.pages.kb_source_suggestions
+        .as_ref()
         .map(|(cached, _)| cached != &source_query)
         .unwrap_or(true);
+
     if suggestions_changed {
-        l.pages.kb_source_suggestions = Some((source_query.clone(), source_suggestions(&l.pages.kb_source_paths, &source_query)));
+        l.pages.kb_source_suggestions = Some((
+            source_query.clone(),
+            source_suggestions(&l.pages.kb_source_paths, &source_query),
+        ));
     }
-    let suggestions = l.pages.kb_source_suggestions.as_ref().map(|(_, paths)| paths.as_slice()).unwrap_or(&[]);
+
+    let suggestions = l.pages.kb_source_suggestions
+        .as_ref()
+        .map(|(_, paths)| paths.as_slice())
+        .unwrap_or(&[]);
+
     let source_query_normalized = normalize_source_query(&source_query);
-    let exact_source = suggestions.iter().any(|path| normalize_source_query(path) == source_query_normalized);
-    let show_suggestions = !source_query_normalized.is_empty() && !exact_source && !suggestions.is_empty();
-    let suggestions_height = if show_suggestions { (suggestions.len() as f32 * 28.0).min(140.0) } else { 0.0 };
+    let exact_source = suggestions
+        .iter()
+        .any(|path| normalize_source_query(path) == source_query_normalized);
+
+    let show_suggestions =
+        !source_query_normalized.is_empty() && !exact_source && !suggestions.is_empty();
+
+    let suggestions_height = if show_suggestions {
+        (suggestions.len() as f32 * 28.0).min(140.0)
+    } else {
+        0.0
+    };
+
     let mut selected_source = None;
+
     if show_suggestions {
         let suggestion_list = Rect::new(
             inner.x + filter_w + filter_gap,
@@ -1902,118 +2005,332 @@ pub fn keybind_picker(l: &mut Launcher) {
             filter_w,
             suggestions_height,
         );
-        l.ui.scroll_area("kb-source-suggestions", suggestion_list, &mut |ui, view| {
-            let row_h = 28.0;
-            let offset = suggestion_list.y - view.y;
-            for i in visible_row_range(offset, suggestion_list.h, suggestions.len(), row_h) {
-                let row = Rect::new(view.x + 2.0, view.y + i as f32 * row_h, view.w - 8.0, row_h - 2.0);
-                if ui.row(&format!("kb-source-suggestion-{i}"), row, false) {
-                    selected_source = Some(suggestions[i].clone());
+
+        l.ui.scroll_area(
+            "kb-source-suggestions",
+            suggestion_list,
+            &mut |ui, view| {
+                let row_h = 28.0;
+                let offset = suggestion_list.y - view.y;
+
+                for i in visible_row_range(
+                    offset,
+                    suggestion_list.h,
+                    suggestions.len(),
+                    row_h,
+                ) {
+                    let row = Rect::new(
+                        view.x + 2.0,
+                        view.y + i as f32 * row_h,
+                        view.w - 8.0,
+                        row_h - 2.0,
+                    );
+
+                    if ui.row(&format!("kb-source-suggestion-{i}"), row, false) {
+                        selected_source = Some(suggestions[i].clone());
+                    }
+
+                    ui.text_in(
+                        &suggestions[i],
+                        row.pad(8.0, 0.0),
+                        11.0,
+                        Weight::Regular,
+                        TEXT_SOFT,
+                        Align::Left,
+                    );
                 }
-                ui.text_in(&suggestions[i], row.pad(8.0, 0.0), 11.0, Weight::Regular, TEXT_SOFT, Align::Left);
-            }
-            suggestions.len() as f32 * row_h
-        });
+
+                suggestions.len() as f32 * row_h
+            },
+        );
     }
+
     if let Some(path) = selected_source {
         source_query = path;
         l.pages.kb_picker_source_filter = source_query.clone();
         source_changed = true;
     }
-    let filter_changed = l.pages.kb_filtered_options.as_ref()
+
+    let filter_changed = l.pages.kb_filtered_options
+        .as_ref()
         .map(|(action, source, _)| action != &query || source != &source_query)
         .unwrap_or(true);
+
     if query_changed || source_changed || filter_changed {
         let all = l.pages.kb_action_options.as_deref().unwrap_or_default();
-        l.pages.kb_filtered_options = Some((query.clone(), source_query.clone(), filter_action_options(all, &query, &source_query)));
+
+        l.pages.kb_filtered_options = Some((
+            query.clone(),
+            source_query.clone(),
+            filter_action_options(all, &query, &source_query),
+        ));
+
         if query_changed || source_changed {
             let id = id_of("kb-action-picker");
             l.ui.scroll.insert(id, 0.0);
             l.ui.scroll.insert(id ^ 0xabc, 0.0);
         }
     }
-    let options = l.pages.kb_filtered_options.as_ref().map(|(_, _, options)| options.as_slice()).unwrap_or(&[]);
+
+    let options = l.pages.kb_filtered_options
+        .as_ref()
+        .map(|(_, _, options)| options.as_slice())
+        .unwrap_or(&[]);
+
     let (done, total, current) = &l.pages.kb_script_scan;
+
     let status = if l.pages.kb_script_scan_complete {
-        format!("{} results · scanned {total} vehicle files", options.len())
+        format!(
+            "{} results · scanned {total} vehicle files",
+            options.len()
+        )
     } else if *total > 0 {
-        format!("{} results · scanning {done} / {total} · {current}", options.len())
+        format!(
+            "{} results · scanning {done} / {total} · {current}",
+            options.len()
+        )
     } else if l.pages.kb_script_actions.is_some() {
-        format!("{} results · checking installed bus scripts…", options.len())
+        format!(
+            "{} results · checking installed bus scripts…",
+            options.len()
+        )
     } else {
-        format!("{} results · finding installed bus scripts…", options.len())
+        format!(
+            "{} results · finding installed bus scripts…",
+            options.len()
+        )
     };
+
     let status_y = inner.y + 96.0 + suggestions_height;
-    l.ui.text_in(&status, Rect::new(inner.x, status_y, inner.w, 18.0), 11.5, Weight::Regular, TEXT_DIM, Align::Left);
-    let progress = if *total == 0 { 0.0 } else { *done as f32 / *total as f32 };
-    let progress_r = Rect::new(inner.x, status_y + 20.0, inner.w, 5.0);
-    l.ui.p().rounded(progress_r, 3.0, Color::WHITE.alpha(0.07));
+
+    l.ui.text_in(
+        &status,
+        Rect::new(inner.x, status_y, inner.w, 18.0),
+        11.5,
+        Weight::Regular,
+        TEXT_DIM,
+        Align::Left,
+    );
+
+    let progress = if *total == 0 {
+        0.0
+    } else {
+        *done as f32 / *total as f32
+    };
+
+    let progress_r = Rect::new(
+        inner.x,
+        status_y + 20.0,
+        inner.w,
+        5.0,
+    );
+
+    l.ui.p().rounded(
+        progress_r,
+        3.0,
+        Color::WHITE.alpha(0.07),
+    );
+
     if progress > 0.0 {
-        l.ui.p().rounded(Rect::new(progress_r.x, progress_r.y, progress_r.w * progress, progress_r.h), 3.0, ACCENT);
+        l.ui.p().rounded(
+            Rect::new(
+                progress_r.x,
+                progress_r.y,
+                progress_r.w * progress,
+                progress_r.h,
+            ),
+            3.0,
+            ACCENT,
+        );
     }
-    let list = Rect::new(inner.x - 6.0, inner.y + 130.0 + suggestions_height, inner.w + 12.0, (inner.h - 184.0 - suggestions_height).max(80.0));
+
+    let list = Rect::new(
+        inner.x - 6.0,
+        inner.y + 130.0 + suggestions_height,
+        inner.w + 12.0,
+        (inner.h - 184.0 - suggestions_height).max(80.0),
+    );
+
     let mut picked: Option<String> = None;
     let mut show_sources: Option<(String, Vec<String>)> = None;
     let total_bus_count = l.pages.kb_script_total_buses;
+
     l.ui.scroll_area("kb-action-picker", list, &mut |ui, view| {
         if options.is_empty() {
-            ui.text_in("No matching actions.", Rect::new(view.x + 8.0, view.y + 8.0, view.w - 20.0, 24.0), 13.0, Weight::Regular, TEXT_DIM, Align::Left);
+            ui.text_in(
+                "No matching actions.",
+                Rect::new(
+                    view.x + 8.0,
+                    view.y + 8.0,
+                    view.w - 20.0,
+                    24.0,
+                ),
+                13.0,
+                Weight::Regular,
+                TEXT_DIM,
+                Align::Left,
+            );
+
             return 40.0;
         }
+
         let row_h = 48.0;
         let offset = list.y - view.y;
-        let visible = visible_row_range(offset, list.h, options.len(), row_h);
+
+        let visible = visible_row_range(
+            offset,
+            list.h,
+            options.len(),
+            row_h,
+        );
+
         for i in visible {
             let option = &options[i];
-            let row = Rect::new(view.x + 6.0, view.y + i as f32 * row_h, view.w - 18.0, row_h - 3.0);
+
+            let row = Rect::new(
+                view.x + 6.0,
+                view.y + i as f32 * row_h,
+                view.w - 18.0,
+                row_h - 3.0,
+            );
+
             let bus_count = option.bus_paths.len();
             let has_sources = bus_count > 0;
-            let source_label = bus_usage_label(bus_count, total_bus_count);
+            let source_label = bus_usage_label(
+                bus_count,
+                total_bus_count,
+            );
+
             let source_button_w = if has_sources {
-                ui.width(&source_label, 13.0, Weight::Medium) + 13.0 * 1.3 + 24.0
+                ui.width(
+                    &source_label,
+                    13.0,
+                    Weight::Medium,
+                ) + 13.0 * 1.3 + 24.0
             } else {
                 0.0
             };
-            let action_row = Rect::new(row.x, row.y, row.w - source_button_w, row.h);
-            if ui.row(&format!("kb-picker-action-{}", option.action), action_row, false) {
+
+            let action_row = Rect::new(
+                row.x,
+                row.y,
+                row.w - source_button_w,
+                row.h,
+            );
+
+            if ui.row(
+                &format!("kb-picker-action-{}", option.action),
+                action_row,
+                false,
+            ) {
                 picked = Some(option.action.clone());
             }
-            if has_sources && ui.button(
-                &format!("kb-picker-sources-{}", option.action),
-                Rect::new(row.right() - source_button_w, row.y + 3.0, source_button_w - 4.0, row.h - 6.0),
-                &source_label,
-                Some("list"),
-                ButtonKind::Ghost,
-            ) {
-                show_sources = Some((option.action.clone(), option.bus_paths.clone()));
+
+            if has_sources
+                && ui.button(
+                    &format!("kb-picker-sources-{}", option.action),
+                    Rect::new(
+                        row.right() - source_button_w,
+                        row.y + 3.0,
+                        source_button_w - 4.0,
+                        row.h - 6.0,
+                    ),
+                    &source_label,
+                    Some("list"),
+                    ButtonKind::Ghost,
+                )
+            {
+                show_sources = Some((
+                    option.action.clone(),
+                    option.bus_paths.clone(),
+                ));
             }
-            ui.text_in(&option.label, Rect::new(row.x + 12.0, row.y + 1.0, action_row.w - 24.0, 20.0), 13.0, Weight::Medium, TEXT, Align::Left);
-            ui.text_in(&option.action, Rect::new(row.x + 12.0, row.y + 21.0, action_row.w - 24.0, 16.0), 10.5, Weight::Regular, TEXT_FAINT, Align::Left);
+
+            ui.text_in(
+                &option.label,
+                Rect::new(
+                    row.x + 12.0,
+                    row.y + 1.0,
+                    action_row.w - 24.0,
+                    20.0,
+                ),
+                13.0,
+                Weight::Medium,
+                TEXT,
+                Align::Left,
+            );
+
+            ui.text_in(
+                &option.action,
+                Rect::new(
+                    row.x + 12.0,
+                    row.y + 21.0,
+                    action_row.w - 24.0,
+                    16.0,
+                ),
+                10.5,
+                Weight::Regular,
+                TEXT_FAINT,
+                Align::Left,
+            );
         }
+
         options.len() as f32 * row_h
     });
+
     if let Some(request) = show_sources {
         l.pages.kb_source_action = Some(request);
     }
+
     let by = inner.bottom() - 38.0;
-    let custom = query.trim();
-    let custom_valid = custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    && !options.iter().any(|option| option.action.eq_ignore_ascii_case(custom));
-    if custom_valid && l.ui.button("kb-picker-custom", Rect::new(inner.x, by, 220.0, 36.0), "Add custom action", Some("add"), ButtonKind::Normal) {
-        picked = Some(custom.to_string());
-    }
-    if l.ui.button("kb-picker-cancel", Rect::new(inner.right() - 110.0, by, 110.0, 36.0), "Cancel", None, ButtonKind::Ghost) {
+
+    if l.ui.button(
+        "kb-picker-cancel",
+        Rect::new(inner.right() - 110.0, by, 110.0, 36.0),
+        "Cancel",
+        None,
+        ButtonKind::Ghost,
+    ) {
         l.pages.kb_picker = None;
         l.pages.kb_picker_filter.clear();
         l.pages.kb_picker_source_filter.clear();
         return;
     }
+
     if let Some(action) = picked {
-        let key = if section == 0 { "vehicles" } else { "game" };
-        if let Some(bindings) = l.state.keybindings.get_mut(key).and_then(Value::as_array_mut) {
-            bindings.push(json!({ "action": action, "scan_code": 0, "modifier": 0 }));
-            l.pages.capturing = Some((section, bindings.len() - 1));
+        let key = if section == 0 {
+            "vehicles"
+        } else {
+            "game"
+        };
+
+        if let Some(bindings) = l
+            .state
+            .keybindings
+            .get_mut(key)
+            .and_then(Value::as_array_mut)
+        {
+            bindings.push(json!({
+                "action": action,
+                "scan_code": 0,
+                "modifier": 0
+            }));
+
+            l.pages.capturing = Some((
+                section,
+                bindings.len() - 1,
+            ));
         }
+
+        // Keep the main keyboard list focused on the newly added action.
+        // This also preserves the direct custom-action workflow from #854.
+        l.pages.kb_filter[section] = action.clone();
+
+        l.state.set_status(
+            "Binding added. Press the key you want to use (Escape cancels).",
+            false,
+        );
+
         l.pages.kb_action_options = None;
         l.pages.kb_filtered_options = None;
         l.pages.controller_action_choices = None;
@@ -3619,7 +3936,7 @@ mod keybind_picker_tests {
         assert!(actions.contains(&"door".to_string()));
         let door = actions.iter().position(|action| action == "door").unwrap();
         assert!(labels[door].starts_with("Keyboard: "));
-        assert_eq!(actions.len(), 39);
+        assert_eq!(actions.len(), 40);
         assert!(actions.contains(&"door".to_string()));
         assert!(actions.contains(&"kw_s_1_fest".to_string()));
         assert!(!actions.contains(&"unbound_script_trigger".to_string()));
