@@ -1196,7 +1196,6 @@ struct KeyActionOption {
     label: String,
     sources: Vec<String>,
     bus_paths: Vec<String>,
-    bus_tooltip: Option<String>,
 }
 
 fn action_options(
@@ -1211,7 +1210,6 @@ fn action_options(
             label,
             sources: vec!["Installed key-language files".into()],
             bus_paths: Vec::new(),
-            bus_tooltip: None,
         });
     }
     for (action, sources) in script_actions {
@@ -1220,7 +1218,6 @@ fn action_options(
             label: action_text(names, action),
             sources: Vec::new(),
             bus_paths: Vec::new(),
-            bus_tooltip: None,
         });
         for source in sources {
             let source = format!("Bus script: {source}");
@@ -1237,7 +1234,6 @@ fn action_options(
                     label: action_text(names, action),
                     sources: Vec::new(),
                     bus_paths: Vec::new(),
-                    bus_tooltip: None,
                 });
                 if !option.sources.iter().any(|s| s == "Configured binding") {
                     option.sources.push("Configured binding".into());
@@ -1248,7 +1244,6 @@ fn action_options(
     let mut options: Vec<_> = actions.into_values().collect();
     for option in &mut options {
         option.bus_paths = bus_source_paths(&option.sources);
-        option.bus_tooltip = bus_source_path_tooltip(&option.bus_paths);
     }
     options.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()).then_with(|| a.action.to_lowercase().cmp(&b.action.to_lowercase())));
     options
@@ -1260,14 +1255,15 @@ fn controller_action_choices(names: &crate::describe::ControlNames, bindings: &V
     let mut add = |action: &str, group: &str| {
         if !actions.iter().any(|known| known.eq_ignore_ascii_case(action)) {
             actions.push(action.to_string());
-            labels.push(format!("{group}: {}", action_text(names, action)));
+            let label = action_text(names, action);
+            labels.push(if group.is_empty() { label } else { format!("{group}: {label}") });
         }
     };
     for action in ["kw_s_R_fest", "kw_s_1_fest", "kw_s_2_fest", "kw_s_3_fest", "kw_s_4_fest", "kw_s_5_fest", "kw_s_6_fest", "kw_s_7_fest", "kw_s_8_fest", "kw_s_9_fest", "kw_s_10_fest"] {
-        add(action, "Default");
+        add(action, "");
     }
     for action in PAD_GAME_ACTIONS {
-        add(action, "Default");
+        add(action, "");
     }
     for section in ["vehicles", "game"] {
         if let Some(list) = bindings.get(section).and_then(Value::as_array) {
@@ -1345,20 +1341,8 @@ fn bus_source_paths(sources: &[String]) -> Vec<String> {
     paths
 }
 
-fn bus_source_tooltip(sources: &[String]) -> Option<String> {
-    let files = bus_source_paths(sources);
-    bus_source_path_tooltip(&files)
-}
-
-fn bus_source_path_tooltip(files: &[String]) -> Option<String> {
-    const MAX_FILES: usize = 20;
-    let mut visible: Vec<String> = files.iter().take(MAX_FILES)
-        .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path).to_string())
-        .collect();
-    if files.len() > visible.len() {
-        visible.push(format!("... and {} more", files.len() - visible.len()));
-    }
-    (!visible.is_empty()).then(|| visible.join("\n"))
+fn bus_usage_label(bus_count: usize, total_bus_count: usize) -> String {
+    format!("Used by {bus_count}/{total_bus_count} buses")
 }
 
 fn control_names(l: &Launcher) -> &'static crate::describe::ControlNames {
@@ -1655,39 +1639,50 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         }
 
         let list: Vec<(usize, String, i64, i64)> = l.state.keybindings.get(*key).and_then(|a| a.as_array()).map(|a| a.iter().enumerate().map(|(i, b)| (i, b.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string(), b.get("scan_code").and_then(|x| x.as_i64()).unwrap_or(0), b.get("modifier").and_then(|x| x.as_i64()).unwrap_or(0))).collect()).unwrap_or_default();
-        let mut shown: Vec<(usize, String, String, bool)> = list
+        let mut shown: Vec<(usize, String, String, bool, bool)> = list
             .iter()
             .filter(|(_, a, s, m)| q.is_empty() || matches(&action_text(names, a), &q) || a.to_lowercase().contains(&q) || crate::keys::key_name(*s, *m).to_lowercase().contains(&q))
             .map(|(i, a, s, m)| {
                 let clash = *s != 0 && list.iter().any(|(j, _, s2, m2)| j != i && s2 == s && m2 == m);
-                (*i, action_text(names, a), crate::keys::key_name(*s, *m), clash)
+                let duplicate_action = list.iter().filter(|(_, existing, _, _)| existing.eq_ignore_ascii_case(a)).count() > 1;
+                (*i, action_text(names, a), crate::keys::key_name(*s, *m), clash, duplicate_action)
             })
             .collect();
         if sec == 1 {
-            shown.sort_by_key(|(_, label, _, _)| !label.starts_with("VR:"));
+            shown.sort_by_key(|(_, label, _, _, _)| !label.starts_with("VR:"));
         }
         let capturing = l.pages.capturing;
-        // what the row's buttons asked: (entry, cleared) a key cleared or to be pressed,
-        // `more` another key for an entry's action (#854)
-        let mut clicked: Option<(usize, bool)> = None;
+        #[derive(Clone, Copy)]
+        enum BindingRowAction { Capture, Clear, Remove }
+        let mut clicked: Option<(usize, BindingRowAction)> = None;
         let mut more: Option<usize> = None;
         let time = l.ui.time;
         let list_top = inner.y + 62.0;
         l.ui.scroll_area(&format!("kb-{sec}"), Rect::new(inner.x - 6.0, list_top, inner.w + 12.0, inner.bottom() - list_top), &mut |ui, v| {
             let rh = 40.0;
-            for (row, (i, label, keyn, clash)) in shown.iter().enumerate() {
+            for (row, (i, label, keyn, clash, duplicate_action)) in shown.iter().enumerate() {
                 let rr = Rect::new(v.x + 6.0, v.y + row as f32 * rh, v.w - 16.0, rh - 4.0);
                 if rr.bottom() < v.y - 50.0 {
                     continue;
                 }
                 ui.p().rounded(rr, 8.0, Color::WHITE.alpha(0.03));
-                ui.text_in(label, Rect::new(rr.x + 12.0, rr.y, rr.w - 240.0, rr.h), 13.0, Weight::Medium, TEXT_SOFT, Align::Left);
+                ui.text_in(label, Rect::new(rr.x + 12.0, rr.y, rr.w - 280.0, rr.h), 13.0, Weight::Medium, TEXT_SOFT, Align::Left);
+                if *duplicate_action {
+                    let warning = Rect::new(rr.right() - 258.0, rr.center().y - 10.0, 18.0, 20.0);
+                    ui.icon("warning", warning.center(), 15.0, WARN);
+                    if ui.hover(warning) {
+                        ui.tooltip(warning, "This action is already listed. Multiple bindings for the same action are allowed.");
+                    }
+                }
                 // another key for the same action (OMSI's file may give one action
                 // several [entry]s; several actions on one key need nothing more than the
                 // same key pressed for each)
                 let pr = Rect::new(rr.right() - 222.0, rr.y + 5.0, 26.0, rr.h - 10.0);
                 let (hp, _, cp) = ui.interact(id_of(&format!("kb-{sec}-{i}-more")), pr);
                 ui.icon("add", pr.center(), 16.0, if hp { ACCENT } else { TEXT_FAINT });
+                if ui.hover(pr) {
+                    ui.tooltip(pr, "Add another key for this action");
+                }
                 if cp {
                     more = Some(*i);
                 }
@@ -1696,23 +1691,35 @@ pub fn controls(l: &mut Launcher, area: Rect) {
                 let id = id_of(&format!("kb-{sec}-{i}"));
                 let (h, _, c) = ui.interact(id, kr);
                 if c {
-                    clicked = Some((*i, false));
+                    clicked = Some((*i, BindingRowAction::Capture));
                 }
                 let base = if waiting { ACCENT.alpha(0.25 + 0.15 * (time * 6.0).sin().abs()) } else if *clash { DANGER.alpha(0.22) } else { Color::WHITE.alpha(if h { 0.12 } else { 0.07 }) };
                 ui.p().rounded(kr, 6.0, base);
                 ui.p().rounded_border(kr, 6.0, 1.0, if waiting { ACCENT } else if *clash { DANGER } else { Color::WHITE.alpha(0.1) });
                 ui.text_in(if waiting { "press a key…" } else { keyn }, kr, 12.0, Weight::Bold, if *clash { DANGER.lighten(0.3) } else { TEXT }, Align::Center);
+                let dr = Rect::new(rr.right() - 62.0, rr.y + 5.0, 26.0, rr.h - 10.0);
+                let (_, _, cd) = ui.interact(id_of(&format!("kb-{sec}-{i}-clear")), dr);
+                ui.icon("delete", dr.center(), 16.0, TEXT);
+                if ui.hover(dr) {
+                    ui.tooltip(dr, "Clear this key binding");
+                }
+                if cd {
+                    clicked = Some((*i, BindingRowAction::Clear));
+                }
                 let xr = Rect::new(rr.right() - 32.0, rr.y + 5.0, 26.0, rr.h - 10.0);
-                let (hx, _, cx) = ui.interact(id ^ 1, xr);
+                let (hx, _, cx) = ui.interact(id_of(&format!("kb-{sec}-{i}-remove")), xr);
                 ui.icon("close", xr.center(), 16.0, if hx { DANGER } else { TEXT_FAINT });
+                if ui.hover(xr) {
+                    ui.tooltip(xr, "Remove this key binding");
+                }
                 if cx {
-                    clicked = Some((*i, true));
+                    clicked = Some((*i, BindingRowAction::Remove));
                 }
             }
             shown.len() as f32 * rh
         });
         match clicked {
-            Some((i, true)) => {
+            Some((i, BindingRowAction::Clear)) => {
                 let vr_binding = l.state.keybindings.get(*key).and_then(|a| a.as_array())
                     .and_then(|a| a.get(i)).and_then(|b| b.get("action"))
                     .and_then(|a| a.as_str()).is_some_and(|a| a.starts_with("vr_"));
@@ -1722,7 +1729,29 @@ pub fn controls(l: &mut Launcher, area: Rect) {
                 }
                 save_keys(l, vr_binding);
             }
-            Some((i, false)) => l.pages.capturing = Some((sec, i)),
+            Some((i, BindingRowAction::Remove)) => {
+                let vr_binding = l.state.keybindings.get(*key).and_then(|a| a.as_array())
+                    .and_then(|a| a.get(i)).and_then(|b| b.get("action"))
+                    .and_then(|a| a.as_str()).is_some_and(|a| a.starts_with("vr_"));
+                if let Some(bindings) = l.state.keybindings.get_mut(*key).and_then(|a| a.as_array_mut()) {
+                    if i < bindings.len() {
+                        bindings.remove(i);
+                    }
+                }
+                if let Some((capturing_sec, capturing_idx)) = l.pages.capturing {
+                    if capturing_sec == sec {
+                        l.pages.capturing = if capturing_idx == i {
+                            None
+                        } else if capturing_idx > i {
+                            Some((capturing_sec, capturing_idx - 1))
+                        } else {
+                            l.pages.capturing
+                        };
+                    }
+                }
+                save_keys(l, vr_binding);
+            }
+            Some((i, BindingRowAction::Capture)) => l.pages.capturing = Some((sec, i)),
             None => {}
         }
         if let Some(i) = more {
@@ -1772,7 +1801,7 @@ pub fn keybind_picker(l: &mut Launcher) {
         "kb-picker-source-search",
         Rect::new(inner.x + filter_w + filter_gap, inner.y + 54.0, filter_w, 36.0),
         &mut source_query,
-        "Bus file or folder…",
+        "Filter by bus folder or bus file (.bus)",
         Some("folder_open"),
     );
     l.pages.kb_picker_source_filter = source_query.clone();
@@ -1845,6 +1874,7 @@ pub fn keybind_picker(l: &mut Launcher) {
     let list = Rect::new(inner.x - 6.0, inner.y + 130.0 + suggestions_height, inner.w + 12.0, (inner.h - 184.0 - suggestions_height).max(80.0));
     let mut picked: Option<String> = None;
     let mut show_sources: Option<(String, Vec<String>)> = None;
+    let total_bus_count = l.pages.kb_script_scan.1;
     l.ui.scroll_area("kb-action-picker", list, &mut |ui, view| {
         if options.is_empty() {
             ui.text_in("No matching actions.", Rect::new(view.x + 8.0, view.y + 8.0, view.w - 20.0, 24.0), 13.0, Weight::Regular, TEXT_DIM, Align::Left);
@@ -1858,7 +1888,12 @@ pub fn keybind_picker(l: &mut Launcher) {
             let row = Rect::new(view.x + 6.0, view.y + i as f32 * row_h, view.w - 18.0, row_h - 3.0);
             let bus_count = option.bus_paths.len();
             let has_sources = bus_count > 0;
-            let source_button_w = if has_sources { 94.0 } else { 0.0 };
+            let source_label = bus_usage_label(bus_count, total_bus_count);
+            let source_button_w = if has_sources {
+                ui.width(&source_label, 13.0, Weight::Medium) + 13.0 * 1.3 + 24.0
+            } else {
+                0.0
+            };
             let action_row = Rect::new(row.x, row.y, row.w - source_button_w, row.h);
             if ui.row(&format!("kb-picker-action-{}", option.action), action_row, false) {
                 picked = Some(option.action.clone());
@@ -1866,16 +1901,11 @@ pub fn keybind_picker(l: &mut Launcher) {
             if has_sources && ui.button(
                 &format!("kb-picker-sources-{}", option.action),
                 Rect::new(row.right() - source_button_w, row.y + 3.0, source_button_w - 4.0, row.h - 6.0),
-                &format!("{bus_count} bus{}", if bus_count == 1 { "" } else { "es" }),
+                &source_label,
                 Some("list"),
                 ButtonKind::Ghost,
             ) {
                 show_sources = Some((option.action.clone(), option.bus_paths.clone()));
-            }
-            if ui.hover(action_row) {
-                if let Some(files) = &option.bus_tooltip {
-                    ui.tooltip(action_row, files);
-                }
             }
             ui.text_in(&option.label, Rect::new(row.x + 12.0, row.y + 1.0, action_row.w - 24.0, 20.0), 13.0, Weight::Medium, TEXT, Align::Left);
             ui.text_in(&option.action, Rect::new(row.x + 12.0, row.y + 21.0, action_row.w - 24.0, 16.0), 10.5, Weight::Regular, TEXT_FAINT, Align::Left);
@@ -3396,7 +3426,7 @@ mod keybind_picker_tests {
         assert!(actions.contains(&"mod_custom_action"));
         let mod_action = all.iter().find(|option| option.action == "mod_custom_action").unwrap();
         assert!(mod_action.sources.contains(&"Configured binding".into()));
-        assert_eq!(bus_source_tooltip(&mod_action.sources).as_deref(), Some("Vehicle.bus\nIVU.bus\nAnother.bus\nThird.bus\nFourth.bus"));
+        assert_eq!(mod_action.bus_paths.len(), 5);
 
         let matches = filter_action_options(&all, "front door", "");
         assert_eq!(matches.len(), 1);
@@ -3415,17 +3445,6 @@ mod keybind_picker_tests {
     }
 
     #[test]
-    fn huge_bus_source_tooltip_is_bounded_with_a_remainder_count() {
-        let sources: Vec<String> = (0..25)
-            .map(|i| format!("Bus script: Pack{i}/Vehicle{i}.bus"))
-            .collect();
-        let tooltip = bus_source_tooltip(&sources).unwrap();
-        let lines: Vec<&str> = tooltip.lines().collect();
-        assert_eq!(lines.len(), 21);
-        assert_eq!(lines.last(), Some(&"... and 5 more"));
-    }
-
-    #[test]
     fn empty_query_keeps_catalog_entries_past_twelve() {
         let names = crate::describe::ControlNames::from_table("ENG", &[]);
         let script_actions: std::collections::HashMap<String, Vec<String>> = (0..40)
@@ -3433,6 +3452,12 @@ mod keybind_picker_tests {
             .collect();
         let options = action_options(&names, &script_actions, &json!({}));
         assert_eq!(filter_action_options(&options, "", "").len(), 40);
+    }
+
+    #[test]
+    fn bus_usage_label_shows_the_action_count_out_of_the_scan_total() {
+        assert_eq!(bus_usage_label(5, 25), "Used by 5/25 buses");
+        assert_eq!(bus_usage_label(1, 25), "Used by 1/25 buses");
     }
 
     #[test]
@@ -3477,7 +3502,8 @@ mod keybind_picker_tests {
         assert_eq!(actions.first().map(String::as_str), Some("<none>"));
         assert_eq!(actions.get(1).map(String::as_str), Some("kw_s_R_fest"));
         let generic = actions.iter().position(|action| action == "doors_all").unwrap();
-        assert!(labels[generic].starts_with("Default: "));
+        assert_eq!(labels[generic], action_text(&names, "doors_all"));
+        assert!(!labels[generic].starts_with("Default: "));
         let custom = actions.iter().position(|action| action == "custom_cruise_control").unwrap();
         assert!(labels[custom].starts_with("Keyboard: "));
         assert!(labels[custom].contains("Custom cruise control"));
