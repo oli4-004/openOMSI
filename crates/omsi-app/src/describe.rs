@@ -88,7 +88,7 @@ impl ControlNames {
 
     /// Trigger names compiled from every installed vehicle's scripts, including mod buses.
     /// Progress updates carry each action's bus-file provenance as it is found.
-    pub fn scan_script_actions(content_root: Option<std::path::PathBuf>, mut report: impl FnMut(ScriptActionScanUpdate)) {
+    pub fn scan_script_actions(mut report: impl FnMut(ScriptActionScanUpdate)) {
         let mut buses = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for vehicles in omsi_cfg::content_dirs("Vehicles") {
@@ -103,7 +103,7 @@ impl ControlNames {
                     }
                     let key = path.strip_prefix(&vehicles).unwrap_or(&path).to_string_lossy().replace('\\', "/").to_ascii_lowercase();
                     if seen.insert(key) {
-                        let source = vehicle_source(&path, &vehicles, content_root.as_deref());
+                        let source = vehicle_source(&path, &vehicles);
                         buses.push((path, source));
                     }
                 }
@@ -227,14 +227,8 @@ fn scan_bus_scripts(
     }
 }
 
-fn vehicle_source(path: &Path, vehicles: &Path, content_root: Option<&Path>) -> String {
-    let relative = path.strip_prefix(vehicles).unwrap_or(path).to_string_lossy().replace('\\', "/");
-    let origin = if content_root.is_some_and(|root| path.starts_with(root)) {
-        "Modded bus"
-    } else {
-        "OMSI bus"
-    };
-    format!("{origin}: {relative}")
+fn vehicle_source(path: &Path, vehicles: &Path) -> String {
+    path.strip_prefix(vehicles).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
 fn script_triggers(scripts: &[std::path::PathBuf]) -> Vec<String> {
@@ -253,18 +247,17 @@ mod script_action_tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let content_root = dir.join("content");
-        let vehicles = content_root.join("Vehicles");
+        let vehicles = dir.join("Vehicles");
         assert_eq!(
-            vehicle_source(&vehicles.join("CruiseBus/mod_bus.bus"), &vehicles, Some(&content_root)),
-            "Modded bus: CruiseBus/mod_bus.bus",
+            vehicle_source(&vehicles.join("VehiclePack/Vehicle.bus"), &vehicles),
+            "VehiclePack/Vehicle.bus",
         );
         let omsi_root = dir.join("OMSI");
         assert_eq!(
-            vehicle_source(&omsi_root.join("Vehicles/DefaultBus/default.bus"), &omsi_root.join("Vehicles"), Some(&content_root)),
-            "OMSI bus: DefaultBus/default.bus",
+            vehicle_source(&omsi_root.join("Vehicles/DefaultBus/default.bus"), &omsi_root.join("Vehicles")),
+            "DefaultBus/default.bus",
         );
-        let bus = dir.join("mod_bus.bus");
+        let bus = dir.join("Vehicle.bus");
         std::fs::write(&bus, "[script]\n1\nmain.osc\n").unwrap();
         std::fs::write(
             dir.join("main.osc"),
@@ -273,16 +266,16 @@ mod script_action_tests {
 
         let mut updates = Vec::new();
         scan_bus_scripts(
-            vec![(bus, "Modded bus: CruiseBus/mod_bus.bus".into())],
+            vec![(bus, "VehiclePack/Vehicle.bus".into())],
             &mut |update| updates.push(update),
         );
         assert_eq!(updates.len(), 1);
         assert!(updates[0].complete);
         assert_eq!((updates[0].done, updates[0].total), (1, 1));
-        assert_eq!(updates[0].current, "Modded bus: CruiseBus/mod_bus.bus");
+        assert_eq!(updates[0].current, "VehiclePack/Vehicle.bus");
         assert_eq!(updates[0].discovered, [
-            ("cruise_control_toggle".into(), "Modded bus: CruiseBus/mod_bus.bus".into()),
-            ("ivu_ticket_cancel".into(), "Modded bus: CruiseBus/mod_bus.bus".into()),
+            ("cruise_control_toggle".into(), "VehiclePack/Vehicle.bus".into()),
+            ("ivu_ticket_cancel".into(), "VehiclePack/Vehicle.bus".into()),
         ]);
         std::fs::remove_dir_all(dir).unwrap();
     }
