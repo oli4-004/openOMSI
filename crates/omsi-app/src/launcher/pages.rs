@@ -30,10 +30,12 @@ pub struct PagesView {
     pub setup_game: Option<String>,
     /// The Controls page's tab: 0 the keyboard, 1 the game controllers.
     pub controls_tab: usize,
-    /// Trigger names collected from installed vehicle scripts for the action picker.
-    pub kb_script_actions: Option<Vec<String>>,
-    pub kb_script_actions_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// Sources indexed by action name, filled as installed vehicle scripts are scanned.
+    pub kb_script_actions: Option<std::collections::HashMap<String, Vec<String>>>,
+    pub kb_script_actions_rx: Option<std::sync::mpsc::Receiver<crate::describe::ScriptActionScanUpdate>>,
     pub kb_script_action_generation: Option<u64>,
+    pub kb_script_scan: (usize, usize, String),
+    pub kb_script_scan_complete: bool,
     /// The Settings page's tab (see `SETTINGS_TABS`).
     pub settings_tab: usize,
     pub pads: PadsView,
@@ -1179,27 +1181,72 @@ fn action_text(names: &crate::describe::ControlNames, a: &str) -> String {
     known_action(a).unwrap_or_else(|| names.control(a))
 }
 
-fn action_options(names: &crate::describe::ControlNames, script_actions: &[String], bindings: &Value, query: &str) -> Vec<(String, String)> {
-    let mut actions = names.actions();
-    for action in script_actions {
-        if !actions.iter().any(|(known, _)| known.eq_ignore_ascii_case(action)) {
-            actions.push((action.clone(), action_text(names, action)));
+struct KeyActionOption {
+    action: String,
+    label: String,
+    sources: Vec<String>,
+}
+
+fn action_options(
+    names: &crate::describe::ControlNames,
+    script_actions: &std::collections::HashMap<String, Vec<String>>,
+    bindings: &Value,
+    query: &str,
+) -> Vec<KeyActionOption> {
+    let mut actions: std::collections::HashMap<String, KeyActionOption> = std::collections::HashMap::new();
+    for (action, label) in names.actions() {
+        actions.insert(action.to_ascii_lowercase(), KeyActionOption {
+            action,
+            label,
+            sources: vec!["Installed key-language files".into()],
+        });
+    }
+    for (action, sources) in script_actions {
+        let option = actions.entry(action.to_ascii_lowercase()).or_insert_with(|| KeyActionOption {
+            action: action.clone(),
+            label: action_text(names, action),
+            sources: Vec::new(),
+        });
+        for source in sources {
+            let source = format!("Bus script: {source}");
+            if !option.sources.contains(&source) {
+                option.sources.push(source);
+            }
         }
     }
     for section in ["vehicles", "game"] {
         if let Some(list) = bindings.get(section).and_then(Value::as_array) {
             for action in list.iter().filter_map(|binding| binding.get("action").and_then(Value::as_str)) {
-                if !actions.iter().any(|(known, _)| known.eq_ignore_ascii_case(action)) {
-                    actions.push((action.to_string(), action_text(names, action)));
+                let option = actions.entry(action.to_ascii_lowercase()).or_insert_with(|| KeyActionOption {
+                    action: action.to_string(),
+                    label: action_text(names, action),
+                    sources: Vec::new(),
+                });
+                if !option.sources.iter().any(|s| s == "Configured binding") {
+                    option.sources.push("Configured binding".into());
                 }
             }
         }
     }
-    actions.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
     let query = query.trim().to_lowercase();
-    actions.into_iter().filter(|(action, label)| {
-        query.is_empty() || action.to_lowercase().contains(&query) || label.to_lowercase().contains(&query)
-    }).collect()
+    let mut options: Vec<_> = actions.into_values().filter(|option| {
+        query.is_empty()
+            || option.action.to_lowercase().contains(&query)
+            || option.label.to_lowercase().contains(&query)
+            || option.sources.iter().any(|source| source.to_lowercase().contains(&query))
+    }).collect();
+    options.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()).then_with(|| a.action.to_lowercase().cmp(&b.action.to_lowercase())));
+    options
+}
+
+fn action_source_text(sources: &[String]) -> String {
+    let mut visible: Vec<String> = sources.iter().filter(|s| !s.starts_with("Bus script:")).cloned().collect();
+    let buses: Vec<&str> = sources.iter().filter_map(|s| s.strip_prefix("Bus script: ")).collect();
+    visible.extend(buses.iter().take(2).map(|s| (*s).to_string()));
+    if buses.len() > 2 {
+        visible.push(format!("+ {} other buses", buses.len() - 2));
+    }
+    if visible.is_empty() { "Source unknown".into() } else { visible.join(" · ") }
 }
 
 fn control_names(l: &Launcher) -> &'static crate::describe::ControlNames {
@@ -1517,26 +1564,49 @@ pub fn keybind_picker(l: &mut Launcher) {
     if l.pages.kb_script_action_generation != Some(l.state.content_generation) {
         l.pages.kb_script_actions = None;
         l.pages.kb_script_actions_rx = None;
+        l.pages.kb_script_scan = (0, 0, String::new());
+        l.pages.kb_script_scan_complete = false;
         l.pages.kb_script_action_generation = Some(l.state.content_generation);
     }
     if l.pages.kb_script_actions.is_none() && l.pages.kb_script_actions_rx.is_none() {
-        let _ = core::content_dir();
+        let content_root = core::content_dir();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::describe::ControlNames::script_actions());
+            crate::describe::ControlNames::scan_script_actions(content_root, |update| { let _ = tx.send(update); });
         });
+        l.pages.kb_script_actions = Some(std::collections::HashMap::new());
         l.pages.kb_script_actions_rx = Some(rx);
     }
-    let completed = l.pages.kb_script_actions_rx.as_ref().and_then(|rx| match rx.try_recv() {
-        Ok(actions) => Some(actions),
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
-        Err(std::sync::mpsc::TryRecvError::Empty) => None,
-    });
-    if let Some(actions) = completed {
-        l.pages.kb_script_actions = Some(actions);
+    let mut updates = Vec::new();
+    if let Some(rx) = l.pages.kb_script_actions_rx.as_ref() {
+        loop {
+            match rx.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    l.pages.kb_script_scan_complete = true;
+                    break;
+                }
+            }
+        }
+    }
+    for update in updates {
+        l.pages.kb_script_scan = (update.done, update.total, update.current);
+        if let Some(actions) = l.pages.kb_script_actions.as_mut() {
+            for (action, source) in update.discovered {
+                let sources = actions.entry(action.to_ascii_lowercase()).or_default();
+                if !sources.iter().any(|existing| existing.eq_ignore_ascii_case(&source)) {
+                    sources.push(source);
+                }
+            }
+        }
+        l.pages.kb_script_scan_complete |= update.complete;
+    }
+    if l.pages.kb_script_scan_complete {
         l.pages.kb_script_actions_rx = None;
     }
-    let script_actions = l.pages.kb_script_actions.as_deref().unwrap_or(&[]);
+    let empty_script_actions = std::collections::HashMap::new();
+    let script_actions = l.pages.kb_script_actions.as_ref().unwrap_or(&empty_script_actions);
     let section_name = if section == 0 { "Driving & the bus" } else { "The game" };
     let size = l.ui.size;
     let full = Rect::new(0.0, 0.0, size.x, size.y);
@@ -1553,36 +1623,47 @@ pub fn keybind_picker(l: &mut Launcher) {
     l.ui.text_input("kb-picker-search", Rect::new(inner.x, inner.y + 54.0, inner.w, 36.0), &mut query, "Search actions…", Some("search"));
     l.pages.kb_picker_filter = query.clone();
     let options = action_options(names, script_actions, &l.state.keybindings, &query);
-    let list = Rect::new(inner.x - 6.0, inner.y + 120.0, inner.w + 12.0, (inner.h - 174.0).max(80.0));
-    l.ui.text_in(
-        if l.pages.kb_script_actions.is_some() { "Installed bus controls" } else { "Scanning installed bus scripts for additional controls…" },
-        Rect::new(inner.x, inner.y + 96.0, inner.w, 18.0),
-        11.5, Weight::Regular, TEXT_DIM, Align::Left,
-    );
+    let (done, total, current) = &l.pages.kb_script_scan;
+    let status = if l.pages.kb_script_scan_complete {
+        format!("Scanned {total} vehicle files · source shown on each action")
+    } else if *total > 0 {
+        format!("Scanning vehicle scripts: {done} / {total} · {current}")
+    } else {
+        "Finding installed bus scripts…".to_string()
+    };
+    l.ui.text_in(&status, Rect::new(inner.x, inner.y + 96.0, inner.w, 18.0), 11.5, Weight::Regular, TEXT_DIM, Align::Left);
+    let progress = if *total == 0 { 0.0 } else { *done as f32 / *total as f32 };
+    let progress_r = Rect::new(inner.x, inner.y + 116.0, inner.w, 5.0);
+    l.ui.p().rounded(progress_r, 3.0, Color::WHITE.alpha(0.07));
+    if progress > 0.0 {
+        l.ui.p().rounded(Rect::new(progress_r.x, progress_r.y, progress_r.w * progress, progress_r.h), 3.0, ACCENT);
+    }
+    let list = Rect::new(inner.x - 6.0, inner.y + 130.0, inner.w + 12.0, (inner.h - 184.0).max(80.0));
     let mut picked: Option<String> = None;
     l.ui.scroll_area("kb-action-picker", list, &mut |ui, view| {
         if options.is_empty() {
             ui.text_in("No matching actions.", Rect::new(view.x + 8.0, view.y + 8.0, view.w - 20.0, 24.0), 13.0, Weight::Regular, TEXT_DIM, Align::Left);
             return 40.0;
         }
-        let row_h = 50.0;
-        for (i, (action, label)) in options.iter().enumerate() {
+        let row_h = 66.0;
+        for (i, option) in options.iter().enumerate() {
             let row = Rect::new(view.x + 6.0, view.y + i as f32 * row_h, view.w - 18.0, row_h - 4.0);
             if row.bottom() < view.y || row.y > view.bottom() {
                 continue;
             }
-            if ui.row(&format!("kb-picker-action-{action}"), row, false) {
-                picked = Some(action.clone());
+            if ui.row(&format!("kb-picker-action-{}", option.action), row, false) {
+                picked = Some(option.action.clone());
             }
-            ui.text_in(label, Rect::new(row.x + 12.0, row.y + 3.0, row.w - 24.0, 20.0), 13.0, Weight::Medium, TEXT, Align::Left);
-            ui.text_in(action, Rect::new(row.x + 12.0, row.y + 24.0, row.w - 24.0, 16.0), 10.5, Weight::Regular, TEXT_FAINT, Align::Left);
+            ui.text_in(&option.label, Rect::new(row.x + 12.0, row.y + 2.0, row.w - 24.0, 20.0), 13.0, Weight::Medium, TEXT, Align::Left);
+            ui.text_in(&option.action, Rect::new(row.x + 12.0, row.y + 22.0, row.w - 24.0, 15.0), 10.5, Weight::Regular, TEXT_FAINT, Align::Left);
+            ui.text_in(&action_source_text(&option.sources), Rect::new(row.x + 12.0, row.y + 37.0, row.w - 24.0, 17.0), 9.5, Weight::Regular, TEXT_DIM, Align::Left);
         }
         options.len() as f32 * row_h
     });
     let by = inner.bottom() - 38.0;
     let custom = query.trim();
-    let custom_valid = l.pages.kb_script_actions.is_some() && custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !options.iter().any(|(action, _)| action.eq_ignore_ascii_case(custom));
+    let custom_valid = l.pages.kb_script_scan_complete && custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !options.iter().any(|option| option.action.eq_ignore_ascii_case(custom));
     if custom_valid && l.ui.button("kb-picker-custom", Rect::new(inner.x, by, 220.0, 36.0), "Add custom action", Some("add"), ButtonKind::Normal) {
         picked = Some(custom.to_string());
     }
@@ -3045,16 +3126,26 @@ mod keybind_picker_tests {
             "game": [{ "action": "mod_custom_action" }],
             "vehicles": [{ "action": "door" }],
         });
+        let script_sources = std::collections::HashMap::from([
+            ("mod_custom_action".into(), vec!["CruiseBus/mod_bus.bus (Cruise Bus)".into()]),
+        ]);
 
-        let all = action_options(&names, &[], &bindings, "");
-        let actions: Vec<&str> = all.iter().map(|(action, _)| action.as_str()).collect();
+        let all = action_options(&names, &script_sources, &bindings, "");
+        let actions: Vec<&str> = all.iter().map(|option| option.action.as_str()).collect();
         assert_eq!(actions.len(), 3);
         assert!(actions.contains(&"door"));
         assert!(actions.contains(&"horn"));
         assert!(actions.contains(&"mod_custom_action"));
+        let mod_action = all.iter().find(|option| option.action == "mod_custom_action").unwrap();
+        assert!(mod_action.sources.contains(&"Configured binding".into()));
+        assert!(action_source_text(&mod_action.sources).contains("CruiseBus/mod_bus.bus"));
 
-        let matches = action_options(&names, &[], &bindings, "front door");
+        let matches = action_options(&names, &script_sources, &bindings, "front door");
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].0, "door");
+        assert_eq!(matches[0].action, "door");
+
+        let matches = action_options(&names, &script_sources, &bindings, "cruisebus");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].action, "mod_custom_action");
     }
 }
