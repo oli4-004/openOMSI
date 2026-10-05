@@ -1307,23 +1307,22 @@ fn action_options(
 fn controller_action_choices(names: &crate::describe::ControlNames, bindings: &Value) -> (Vec<String>, Vec<String>) {
     let mut actions = vec!["<none>".to_string()];
     let mut labels = vec!["<none>".to_string()];
-    let mut add = |action: &str, group: &str| {
+    let mut add = |action: &str| {
         if !actions.iter().any(|known| known.eq_ignore_ascii_case(action)) {
             actions.push(action.to_string());
-            let label = action_text(names, action);
-            labels.push(if group.is_empty() { label } else { format!("{group}: {label}") });
+            labels.push(action_text(names, action));
         }
     };
     for action in ["kw_s_R_fest", "kw_s_1_fest", "kw_s_2_fest", "kw_s_3_fest", "kw_s_4_fest", "kw_s_5_fest", "kw_s_6_fest", "kw_s_7_fest", "kw_s_8_fest", "kw_s_9_fest", "kw_s_10_fest"] {
-        add(action, "");
+        add(action);
     }
     for action in PAD_GAME_ACTIONS {
-        add(action, "");
+        add(action);
     }
     for section in ["vehicles", "game"] {
         if let Some(list) = bindings.get(section).and_then(Value::as_array) {
             for action in list.iter().filter_map(|binding| binding.get("action").and_then(Value::as_str)) {
-                add(action, "Keyboard");
+                add(action);
             }
         }
     }
@@ -3931,11 +3930,11 @@ mod keybind_picker_tests {
         assert_eq!(labels[generic], action_text(&names, "doors_all"));
         assert!(!labels[generic].starts_with("Default: "));
         let custom = actions.iter().position(|action| action == "custom_cruise_control").unwrap();
-        assert!(labels[custom].starts_with("Keyboard: "));
+        assert_eq!(labels[custom], action_text(&names, "custom_cruise_control"));
         assert!(labels[custom].contains("Custom cruise control"));
         assert!(actions.contains(&"door".to_string()));
         let door = actions.iter().position(|action| action == "door").unwrap();
-        assert!(labels[door].starts_with("Keyboard: "));
+        assert_eq!(labels[door], action_text(&names, "door"));
         assert_eq!(actions.len(), 40);
         assert!(actions.contains(&"door".to_string()));
         assert!(actions.contains(&"kw_s_1_fest".to_string()));
