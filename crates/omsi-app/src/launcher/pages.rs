@@ -1997,8 +1997,8 @@ pub fn keybind_picker(l: &mut Launcher) {
     }
     let by = inner.bottom() - 38.0;
     let custom = query.trim();
-    let custom_valid = l.pages.kb_script_scan_complete && custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !options.iter().any(|option| option.action.eq_ignore_ascii_case(custom));
+    let custom_valid = custom.len() > 1 && custom.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    && !options.iter().any(|option| option.action.eq_ignore_ascii_case(custom));
     if custom_valid && l.ui.button("kb-picker-custom", Rect::new(inner.x, by, 220.0, 36.0), "Add custom action", Some("add"), ButtonKind::Normal) {
         picked = Some(custom.to_string());
     }
